@@ -5,107 +5,117 @@ import (
     "encoding/json"
     "fmt"
     "log"
+    "math"
     "net/http"
     "sync"
 )
 
-// OrderFulfillmentStatus represents the fulfillment status of an order
-type OrderFulfillmentStatus struct {
-    OrderID                 string
-    OrderStatus             string
-    OrderFulfillmentDetails []OrderFulfillmentDetail
-    OrderTotalCost          float64
-}
-
-// OrderFulfillmentDetail represents the details of the order fulfillment for a product
-type OrderFulfillmentDetail struct {
-    SupplierID        string
-    ProductID         string
-    QuantityFulfilled int
-    OrderCost         float64
-}
-
-// Order represents an order request from the client
 type Order struct {
-    OrderID      string
-    OrderDetails []OrderDetail
+    OrderID     string           `json:"orderId"`
+    OrderDate   string           `json:"orderDate"`
+    ProductList []OrderedProduct `json:"products"`
 }
 
-// OrderDetail represents details of an ordered product
-type OrderDetail struct {
-    ProductID string
-    Quantity  int
+type OrderedProduct struct {
+    ProductID string `json:"productId"`
+    Quantity  int64  `json:"quantity"`
 }
 
-// Static data to simulate products and suppliers
-var staticProductDetails = map[string]Product{
-    "P1": {SupplierIds: []string{"S1", "S2"}, ProductPrice: 10},
-    "P2": {SupplierIds: []string{"S3", "S4"}, ProductPrice: 20},
+type OrderFulfillmentStatus struct {
+    OrderID               string                 `json:"orderId"`
+    OrderStatus           string                 `json:"orderStatus"`
+    OrderFulfillmentDetails []OrderFulfillmentDetail `json:"orderDetails"`
+    OrderTotalCost        float64                `json:"orderTotalCost"`
 }
 
-// Product represents product details with supplier information
+type OrderFulfillmentDetail struct {
+    ProductID          string  `json:"productId"`
+    SupplierID         string  `json:"supplierId"`
+    QuantityFulfilled  int64   `json:"quantityFulfilled"`
+    IndividualCost     float64 `json:"individualCost"`
+}
+
 type Product struct {
-    SupplierIds  []string
+    ProductID   string
+    SupplierIds []string
     ProductPrice float64
 }
 
-// minInt returns the minimum of two integers
-func minInt(a, b int) int {
+var staticProductDetails = map[string]Product{
+    // This would typically come from an external source or be hardcoded as per the problem definition
+    "P001": {ProductID: "P001", SupplierIds: []string{"S1", "S2", "S3"}, ProductPrice: 50},
+    "P002": {ProductID: "P002", SupplierIds: []string{"S1", "S3"}, ProductPrice: 30},
+}
+
+// Function to handle parallel processing of each product
+func getResponseForOrder(order Order) OrderFulfillmentStatus {
+    var orderTotalCost float64
+    orderResponse := OrderFulfillmentStatus{
+        OrderID:              order.OrderID,
+        OrderStatus:          "FULFILLED",
+        OrderFulfillmentDetails: []OrderFulfillmentDetail{},
+    }
+
+    var wg sync.WaitGroup
+    var mu sync.Mutex
+
+    for i := 0; i < len(order.ProductList); i++ {
+        orderDetail := order.ProductList[i]
+        orderQuantityRequested := orderDetail.Quantity
+        productID := orderDetail.ProductID
+
+        suppliers := staticProductDetails[productID].SupplierIds
+
+        wg.Add(1)
+        go func(orderDetail OrderedProduct, suppliers []string) {
+            defer wg.Done()
+
+            var orderQuantityRemaining = int64(orderQuantityRequested)
+            var orderFulfillmentDetails OrderFulfillmentDetail
+
+            // Iterate over suppliers and fulfill up to 40% or max 100,000 units
+            for j := 0; j < len(suppliers); j++ {
+                if orderQuantityRemaining == 0 {
+                    break
+                }
+
+                quantitySupplied := minInt(orderQuantityRemaining, minInt(100000, int64(float64(orderQuantityRequested)*40/100)))
+                orderFulfillmentDetails = OrderFulfillmentDetail{
+                    ProductID:         productID,
+                    SupplierID:        suppliers[j],
+                    QuantityFulfilled: quantitySupplied,
+                    IndividualCost:    staticProductDetails[productID].ProductPrice * float64(quantitySupplied),
+                }
+
+                mu.Lock()
+                orderTotalCost += orderFulfillmentDetails.IndividualCost
+                orderResponse.OrderFulfillmentDetails = append(orderResponse.OrderFulfillmentDetails, orderFulfillmentDetails)
+                mu.Unlock()
+
+                orderQuantityRemaining -= quantitySupplied
+            }
+
+            if orderQuantityRemaining != 0 {
+                mu.Lock()
+                orderResponse.OrderStatus = "FAILED"
+                mu.Unlock()
+            }
+        }(orderDetail, suppliers)
+    }
+
+    wg.Wait()
+    orderResponse.OrderTotalCost = orderTotalCost
+    fmt.Printf("Successfully processed order id: %s\n", order.OrderID)
+    return orderResponse
+}
+
+func minInt(a, b int64) int64 {
     if a < b {
         return a
     }
     return b
 }
 
-// getResponseForOrder processes an order and returns the fulfillment status
-func getResponseForOrder(order Order, wg *sync.WaitGroup, resultChannel chan<- OrderFulfillmentStatus) {
-    defer wg.Done()
-
-    var orderTotalCost float64
-    var orderResponse = OrderFulfillmentStatus{
-        OrderID:     order.OrderID,
-        OrderStatus: "FULFILLED",
-    }
-
-    // Process each product in the order
-    for _, orderDetail := range order.OrderDetails {
-        productID := orderDetail.ProductID
-        suppliers := staticProductDetails[productID].SupplierIds // Get suppliers for the product
-
-        var orderQuantityRemaining = orderDetail.Quantity
-
-        // Loop through suppliers and fulfill the order
-        for _, supplier := range suppliers {
-            if orderQuantityRemaining == 0 {
-                break
-            }
-            // Assume this is where you calculate how much a supplier can fulfill
-            orderQuantityFulfilled := minInt(orderQuantityRemaining, 100000) // Mock fulfillment
-            orderQuantityRemaining -= orderQuantityFulfilled
-
-            // Accumulate order details and costs
-            orderFulfillmentDetail := OrderFulfillmentDetail{
-                SupplierID:        supplier,
-                QuantityFulfilled: orderQuantityFulfilled,
-                ProductID:         productID,
-                OrderCost:         float64(orderQuantityFulfilled) * staticProductDetails[productID].ProductPrice,
-            }
-            orderResponse.OrderFulfillmentDetails = append(orderResponse.OrderFulfillmentDetails, orderFulfillmentDetail)
-            orderTotalCost += orderFulfillmentDetail.OrderCost
-        }
-
-        // If order cannot be fully fulfilled, set status to "FAILED"
-        if orderQuantityRemaining != 0 {
-            orderResponse.OrderStatus = "FAILED"
-            break // Stop further processing since the order has already failed
-        }
-    }
-
-    orderResponse.OrderTotalCost = orderTotalCost
-    resultChannel <- orderResponse
-}
-
-// httpFunc is the HTTP handler for processing order requests
 func httpFunc(w http.ResponseWriter, r *http.Request) {
     var request Order
     err := json.NewDecoder(r.Body).Decode(&request)
@@ -114,19 +124,7 @@ func httpFunc(w http.ResponseWriter, r *http.Request) {
         return
     }
 
-    // Process the order concurrently
-    resultChannel := make(chan OrderFulfillmentStatus)
-    var wg sync.WaitGroup
-    wg.Add(1)
-    go getResponseForOrder(request, &wg, resultChannel)
-
-    go func() {
-        wg.Wait()
-        close(resultChannel)
-    }()
-
-    // Wait for the result and send the response
-    response := <-resultChannel
+    var response = getResponseForOrder(request)
     w.Header().Set("Content-Type", "application/json")
     json.NewEncoder(w).Encode(response)
 }
